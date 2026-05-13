@@ -34,6 +34,58 @@ export function getEmbeddingProvider(): EmbeddingProvider | null {
   return currentEmbeddingProvider
 }
 
+// Hard cap on embedding input length. Most providers cap input around
+// 8k tokens (~32k chars at ~4 chars/token). Truncate defensively so a
+// huge memory.content can't 400 the embed call or blow context budget
+// on a single doc. 16k chars ≈ 4k tokens, safely under every provider.
+const EMBED_MAX_CHARS = 16_000
+
+export function clipEmbedInput(text: string): string {
+  if (text.length <= EMBED_MAX_CHARS) return text
+  return text.slice(0, EMBED_MAX_CHARS)
+}
+
+// Single guarded vector-index write. Returns true on success. Logs and
+// no-ops on:
+//   - dimension mismatch (mis-configured provider would silently corrupt
+//     the index per #248 otherwise — guarded at persistence load there;
+//     this is the symmetric guard at the write site)
+//   - embed throwing (network, rate limit, provider down)
+// Always soft-fails so a downed embedder doesn't break the upstream save.
+export async function vectorIndexAddGuarded(
+  id: string,
+  sessionId: string,
+  text: string,
+  context: { kind: "memory" | "observation" | "synthetic"; logId: string },
+): Promise<boolean> {
+  const vi = vectorIndex
+  const ep = currentEmbeddingProvider
+  if (!vi || !ep) return false
+  try {
+    const embedding = await ep.embed(clipEmbedInput(text))
+    if (embedding.length !== ep.dimensions) {
+      logger.warn("vector-index add: dimension mismatch — skipping", {
+        kind: context.kind,
+        id: context.logId,
+        provider: ep.name,
+        expected: ep.dimensions,
+        received: embedding.length,
+      })
+      return false
+    }
+    vi.add(id, sessionId, embedding)
+    return true
+  } catch (err) {
+    logger.warn("vector-index add: embed failed — skipping", {
+      kind: context.kind,
+      id: context.logId,
+      provider: ep.name,
+      error: err instanceof Error ? err.message : String(err),
+    })
+    return false
+  }
+}
+
 export async function rebuildIndex(kv: StateKV): Promise<number> {
   const idx = getSearchIndex()
   idx.clear()
@@ -50,12 +102,12 @@ export async function rebuildIndex(kv: StateKV): Promise<number> {
       if (memory.isLatest === false) continue
       if (!memory.title || !memory.content) continue
       idx.add(memoryToObservation(memory))
-      if (vectorIndex && currentEmbeddingProvider) {
-        try {
-          const embedding = await currentEmbeddingProvider.embed(memory.title + ' ' + memory.content)
-          vectorIndex.add(memory.id, memory.sessionIds[0] ?? 'memory', embedding)
-        } catch {}
-      }
+      await vectorIndexAddGuarded(
+        memory.id,
+        memory.sessionIds[0] ?? 'memory',
+        memory.title + ' ' + memory.content,
+        { kind: "memory", logId: memory.id },
+      )
       count++
     }
   } catch (err) {
@@ -90,12 +142,12 @@ export async function rebuildIndex(kv: StateKV): Promise<number> {
     for (const obs of observations) {
       if (obs.title && obs.narrative) {
         idx.add(obs)
-        if (vectorIndex && currentEmbeddingProvider) {
-          try {
-            const embedding = await currentEmbeddingProvider.embed(obs.title + ' ' + obs.narrative)
-            vectorIndex.add(obs.id, obs.sessionId, embedding)
-          } catch {}
-        }
+        await vectorIndexAddGuarded(
+          obs.id,
+          obs.sessionId,
+          obs.title + ' ' + obs.narrative,
+          { kind: "observation", logId: obs.id },
+        )
         count++
       }
     }

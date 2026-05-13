@@ -6,7 +6,7 @@ import { withKeyedLock } from "../state/keyed-mutex.js";
 import { memoryToObservation } from "../state/memory-utils.js";
 import { deleteAccessLog } from "./access-tracker.js";
 import { recordAudit } from "./audit.js";
-import { getSearchIndex, getVectorIndex, getEmbeddingProvider } from "./search.js";
+import { getSearchIndex, vectorIndexAddGuarded } from "./search.js";
 import { logger } from "../logger.js";
 
 export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
@@ -112,19 +112,12 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
             error: err instanceof Error ? err.message : String(err),
           });
         }
-        try {
-          const vi = getVectorIndex();
-          const ep = getEmbeddingProvider();
-          if (vi && ep) {
-            const embedding = await ep.embed(memory.title + ' ' + memory.content);
-            vi.add(memory.id, memory.sessionIds[0] ?? 'memory', embedding);
-          }
-        } catch (err) {
-          logger.warn("Failed to vector-index saved memory", {
-            memId: memory.id,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
+        await vectorIndexAddGuarded(
+          memory.id,
+          memory.sessionIds[0] ?? "memory",
+          memory.title + " " + memory.content,
+          { kind: "memory", logId: memory.id },
+        );
 
         if (supersededId) {
           await sdk.trigger({
